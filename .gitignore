@@ -1,0 +1,8 @@
+# Credenciales: NUNCA se suben al repositorio
+.env
+
+# Editores y sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
