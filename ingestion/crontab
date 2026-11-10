@@ -1,0 +1,2 @@
+# minuto hora día-del-mes mes día-de-la-semana comando
+*/5 * * * * /app/.venv/bin/python /app/ingestion/processor.py

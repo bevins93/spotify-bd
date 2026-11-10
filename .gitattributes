@@ -1,0 +1,3 @@
+# Siempre LF: el crontab y los .py corren en Linux dentro de Docker
+* text=auto eol=lf
+*.png binary

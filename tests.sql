@@ -69,16 +69,50 @@ WHERE NOT EXISTS (SELECT 1 FROM library_song  ls WHERE ls.library_id = l.library
 ORDER BY email, tipo, nombre;
 
 \echo
-\echo '--- 5. Canción más escuchada ---'
--- NO SE PUEDE RESPONDER con esta base. Ninguna tabla registra
--- reproducciones: playlist_song y library_song solo dicen qué canciones
--- se agregaron o guardaron, no cuántas veces se escucharon.
--- Le falta una tabla de reproducciones, por ejemplo:
---   plays (play_id PK, subscriber_id FK, song_id FK, played_at timestamp)
--- y entonces la consulta sería:
---   SELECT s.title, count(*) FROM plays p JOIN songs s USING (song_id)
---   GROUP BY s.title ORDER BY count(*) DESC LIMIT 1;
-\echo 'Sin respuesta: falta una tabla de reproducciones (ver comentario en tests.sql).'
+\echo '--- 5. Canción más escuchada (desde siempre; con empates, salen todas) ---'
+-- Antes no se podía responder: ninguna tabla registraba reproducciones.
+-- Ahora song_daily_play guarda las reproducciones válidas de cada canción por día.
+WITH total AS (
+    SELECT s.song_id, s.title, sum(d.num_rep) AS reproducciones
+    FROM song_daily_play d
+    JOIN songs s ON s.song_id = d.song_id
+    GROUP BY s.song_id, s.title
+)
+SELECT song_id, title, reproducciones
+FROM total
+WHERE reproducciones = (SELECT max(reproducciones) FROM total)
+ORDER BY song_id;
+
+\echo
+\echo '--- 6. Top 100 semanal: última semana completa, de lunes a domingo (UTC) ---'
+-- Si hoy es martes 3 de noviembre, va del lunes 26 de octubre al domingo 1 de
+-- noviembre: la semana en curso no cuenta. date_trunc('week', ...) devuelve el
+-- lunes de la semana actual; la semana anterior empieza 7 días antes.
+-- Las fechas se calculan en UTC sin importar la zona horaria de la sesión.
+-- Con empates en reproducciones, se ordena por song_id para que el top sea estable.
+SELECT (date_trunc('week', now() AT TIME ZONE 'UTC')::date - 7) AS semana_ini,
+       (date_trunc('week', now() AT TIME ZONE 'UTC')::date - 1) AS semana_fin \gset
+\echo Semana del :semana_ini al :semana_fin
+SELECT row_number() OVER (ORDER BY sum(d.num_rep) DESC, d.song_id) AS posicion,
+       d.song_id, s.title AS cancion, sum(d.num_rep) AS reproducciones
+FROM song_daily_play d
+JOIN songs s ON s.song_id = d.song_id
+WHERE d.play_date >= :'semana_ini'::date
+  AND d.play_date <  :'semana_ini'::date + 7
+GROUP BY d.song_id, s.title
+ORDER BY posicion
+LIMIT 100;
+
+\echo
+\echo '--- 7. Las 20 canciones más escuchadas de un suscriptor (ana, id 1; desde siempre) ---'
+\set suscriptor 1
+SELECT row_number() OVER (ORDER BY p.num_rep DESC, p.song_id) AS posicion,
+       p.song_id, s.title AS cancion, p.num_rep AS reproducciones
+FROM subscriber_song_play p
+JOIN songs s ON s.song_id = p.song_id
+WHERE p.subscriber_id = :suscriptor
+ORDER BY posicion
+LIMIT 20;
 
 
 \echo
@@ -148,6 +182,19 @@ VALUES (999, 'Canción vacía', 0, 'Pop');
 
 
 \echo
+\echo '--- PRIMARY KEY: un suscriptor tiene una sola fila por canción en subscriber_song_play ---'
+INSERT INTO subscriber_song_play (subscriber_id, song_id, num_rep)
+SELECT subscriber_id, song_id, 1 FROM subscriber_song_play LIMIT 1;
+
+\echo
+\echo '--- FOREIGN KEY: no hay conteos de un suscriptor que no existe ---'
+INSERT INTO subscriber_song_play (subscriber_id, song_id, num_rep) VALUES (99, 101, 1);
+
+\echo
+\echo '--- CHECK: un conteo guardado es de al menos 1 reproducción ---'
+INSERT INTO song_daily_play (song_id, play_date, num_rep) VALUES (101, '2000-01-03', 0);
+
+\echo
 \echo '=== c) TRANSACCIONES ==='
 
 -- Instantánea del catálogo y del suscriptor 1 (ana), para comparar antes y después.
@@ -210,6 +257,12 @@ INSERT INTO playlist_song (playlist_id, song_id, position, added_at)
 VALUES (15, 101, 1, '2026-11-02'), (15, 106, 2, '2026-11-02');
 INSERT INTO library_song  (library_id, song_id)  VALUES (5, 107);
 INSERT INTO library_album (library_id, album_id) VALUES (5, 205);
+-- Y escuchó canciones: 3 de la 101 y 2 de la 106, en la última semana completa.
+-- Cada reproducción válida se cuenta en las DOS tablas (el processor hace lo mismo).
+INSERT INTO subscriber_song_play (subscriber_id, song_id, num_rep) VALUES (5, 101, 3), (5, 106, 2);
+INSERT INTO song_daily_play (song_id, play_date, num_rep)
+VALUES (101, :'semana_ini'::date, 3), (106, :'semana_ini'::date, 2)
+ON CONFLICT (song_id, play_date) DO UPDATE SET num_rep = song_daily_play.num_rep + EXCLUDED.num_rep;
 
 \echo
 \echo '--- c2) Eliminación con FALLO a medio camino (se olvida borrar el perfil) ---'
@@ -219,6 +272,8 @@ SELECT (SELECT count(*) FROM playlists     WHERE subscriber_id = 1) AS playlists
             (SELECT playlist_id FROM playlists WHERE subscriber_id = 1)) AS canciones_en_playlists,
        (SELECT count(*) FROM library_song  WHERE library_id = 1) AS canciones_guardadas,
        (SELECT count(*) FROM library_album WHERE library_id = 1) AS albumes_guardados,
+       (SELECT count(*) FROM subscriber_song_play WHERE subscriber_id = 1) AS canciones_con_conteo,
+       (SELECT coalesce(sum(num_rep), 0) FROM subscriber_song_play WHERE subscriber_id = 1) AS reproducciones,
        (SELECT count(*) FROM profiles      WHERE subscriber_id = 1) AS perfil,
        (SELECT count(*) FROM subscribers   WHERE subscriber_id = 1) AS suscriptor,
        (SELECT count(*) FROM songs) AS songs,
@@ -232,6 +287,7 @@ DELETE FROM playlists    WHERE subscriber_id = 1;
 DELETE FROM library_song  WHERE library_id = (SELECT library_id FROM libraries WHERE subscriber_id = 1);
 DELETE FROM library_album WHERE library_id = (SELECT library_id FROM libraries WHERE subscriber_id = 1);
 DELETE FROM libraries    WHERE subscriber_id = 1;
+DELETE FROM subscriber_song_play WHERE subscriber_id = 1;
 -- Falla: el perfil todavía referencia al suscriptor (FOREIGN KEY).
 DELETE FROM subscribers  WHERE subscriber_id = 1;
 ROLLBACK;
@@ -242,6 +298,8 @@ SELECT (SELECT count(*) FROM playlists     WHERE subscriber_id = 1) AS playlists
             (SELECT playlist_id FROM playlists WHERE subscriber_id = 1)) AS canciones_en_playlists,
        (SELECT count(*) FROM library_song  WHERE library_id = 1) AS canciones_guardadas,
        (SELECT count(*) FROM library_album WHERE library_id = 1) AS albumes_guardados,
+       (SELECT count(*) FROM subscriber_song_play WHERE subscriber_id = 1) AS canciones_con_conteo,
+       (SELECT coalesce(sum(num_rep), 0) FROM subscriber_song_play WHERE subscriber_id = 1) AS reproducciones,
        (SELECT count(*) FROM profiles      WHERE subscriber_id = 1) AS perfil,
        (SELECT count(*) FROM subscribers   WHERE subscriber_id = 1) AS suscriptor,
        (SELECT count(*) FROM songs) AS songs,
@@ -250,10 +308,17 @@ SELECT (SELECT count(*) FROM playlists     WHERE subscriber_id = 1) AS playlists
 
 \echo
 \echo '--- c2) Eliminación EXITOSA de sofia (suscriptor 5) ---'
+-- Top semanal ANTES de eliminarla (incluye las 5 reproducciones de sofia).
+SELECT d.song_id, sum(d.num_rep) AS reproducciones_semana
+FROM song_daily_play d
+WHERE d.play_date >= :'semana_ini'::date AND d.play_date < :'semana_ini'::date + 7
+GROUP BY d.song_id ORDER BY reproducciones_semana DESC, d.song_id LIMIT 3;
+
 SELECT (SELECT count(*) FROM playlists     WHERE subscriber_id = 5) AS playlists_sofia,
        (SELECT count(*) FROM playlist_song WHERE playlist_id = 15)  AS canciones_en_playlists,
        (SELECT count(*) FROM library_song  WHERE library_id = 5)    AS canciones_guardadas,
        (SELECT count(*) FROM library_album WHERE library_id = 5)    AS albumes_guardados,
+       (SELECT count(*) FROM subscriber_song_play WHERE subscriber_id = 5) AS canciones_con_conteo,
        (SELECT count(*) FROM profiles      WHERE subscriber_id = 5) AS perfil,
        (SELECT count(*) FROM subscribers   WHERE subscriber_id = 5) AS suscriptor,
        (SELECT count(*) FROM songs) AS songs,
@@ -266,6 +331,7 @@ DELETE FROM playlist_song
 DELETE FROM playlists     WHERE subscriber_id = 5;
 DELETE FROM library_song  WHERE library_id = (SELECT library_id FROM libraries WHERE subscriber_id = 5);
 DELETE FROM library_album WHERE library_id = (SELECT library_id FROM libraries WHERE subscriber_id = 5);
+DELETE FROM subscriber_song_play WHERE subscriber_id = 5;
 DELETE FROM libraries     WHERE subscriber_id = 5;
 DELETE FROM profiles      WHERE subscriber_id = 5;
 DELETE FROM subscribers   WHERE subscriber_id = 5;
@@ -276,8 +342,39 @@ SELECT (SELECT count(*) FROM playlists     WHERE subscriber_id = 5) AS playlists
        (SELECT count(*) FROM playlist_song WHERE playlist_id = 15)  AS canciones_en_playlists,
        (SELECT count(*) FROM library_song  WHERE library_id = 5)    AS canciones_guardadas,
        (SELECT count(*) FROM library_album WHERE library_id = 5)    AS albumes_guardados,
+       (SELECT count(*) FROM subscriber_song_play WHERE subscriber_id = 5) AS canciones_con_conteo,
        (SELECT count(*) FROM profiles      WHERE subscriber_id = 5) AS perfil,
        (SELECT count(*) FROM subscribers   WHERE subscriber_id = 5) AS suscriptor,
        (SELECT count(*) FROM songs) AS songs,
        (SELECT count(*) FROM albums) AS albums,
        (SELECT count(*) FROM artists) AS artists;
+
+-- ¿Cambia el top semanal cuando se elimina a un suscriptor?
+-- NO. El top se calcula con song_daily_play, que guarda reproducciones por
+-- canción y por día, sin suscriptor. Al eliminar a sofia se borraron sus filas
+-- de subscriber_song_play (porque tienen llave foránea hacia ella), pero sus
+-- reproducciones siguen en song_daily_play: dejaron de ser "de alguien" y
+-- siguen siendo "de la canción". Comparar el top de arriba con el de abajo:
+-- salen iguales (salvo que el processor haya sumado reproducciones nuevas
+-- entre los dos SELECT).
+-- Consecuencia: después de eliminar a un suscriptor, el total de
+-- subscriber_song_play por canción queda menor que el de song_daily_play, y
+-- verify.py (que exige que cuadren) ya no daría OK. Si el negocio quisiera que
+-- el top "olvide" a quien se fue, habría que restar sus conteos de song_daily_play,
+-- pero esa tabla no sabe de quién fue cada reproducción.
+\echo
+\echo '--- c2) Top semanal DESPUÉS de eliminar a sofia: igual que antes ---'
+SELECT d.song_id, sum(d.num_rep) AS reproducciones_semana
+FROM song_daily_play d
+WHERE d.play_date >= :'semana_ini'::date AND d.play_date < :'semana_ini'::date + 7
+GROUP BY d.song_id ORDER BY reproducciones_semana DESC, d.song_id LIMIT 3;
+
+-- Limpieza: quita las 5 reproducciones de prueba de sofia de song_daily_play
+-- para que el archivo se pueda ejecutar otra vez y deje los conteos como estaban.
+DELETE FROM song_daily_play
+ WHERE ((song_id = 101 AND num_rep = 3) OR (song_id = 106 AND num_rep = 2))
+   AND play_date = :'semana_ini'::date;
+UPDATE song_daily_play SET num_rep = num_rep - 3
+ WHERE song_id = 101 AND play_date = :'semana_ini'::date AND num_rep > 3;
+UPDATE song_daily_play SET num_rep = num_rep - 2
+ WHERE song_id = 106 AND play_date = :'semana_ini'::date AND num_rep > 2;

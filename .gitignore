@@ -1,5 +1,6 @@
-# Credenciales: NUNCA se suben al repositorio
 .env
+.venv/
+__pycache__/
 
 # Editores y sistema
 .vscode/
